@@ -1,0 +1,23 @@
+groups:
+  - name: globi
+    rules:
+      - alert: ApiDown
+        expr: up{job="api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "API e GLOBI POS nuk përgjigjet" }
+      - alert: HighErrorRate
+        expr: sum(rate(globi_http_request_duration_seconds_count{status=~"5.."}[5m])) / sum(rate(globi_http_request_duration_seconds_count[5m])) > 0.02
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Mbi 2% e kërkesave dështojnë" }
+      - alert: FiscalQueueStuck
+        expr: globi_fiscal_pending > 20
+        for: 30m
+        labels: { severity: critical }
+        annotations: { summary: "Fatura të pafiskalizuara në radhë për mbi 30 minuta" }
+      - alert: DiskAlmostFull
+        expr: (node_filesystem_avail_bytes{mountpoint="/host"} / node_filesystem_size_bytes{mountpoint="/host"}) < 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "Disku i serverit nën 15% bosh" }

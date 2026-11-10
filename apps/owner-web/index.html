@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="sq">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f172a">
+<title>GLOBI · Paneli i pronarit</title>
+<style>
+  :root { --bg:#f1f5f9; --card:#fff; --ink:#0f172a; --mut:#64748b; --line:#e2e8f0; --acc:#c2410c; --ok:#15803d; --bad:#b91c1c; --warn:#a16207; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b1120; --card:#111827; --ink:#e5e7eb; --mut:#94a3b8; --line:#1f2937; --acc:#fb923c; --ok:#4ade80; --bad:#f87171; --warn:#facc15; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+  header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:10px; align-items:center; }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); display:inline-block; }
+  .dot.on { background:var(--ok); }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:10px; }
+  .kpi .v { font-size:22px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .kpi .l { color:var(--mut); font-size:13px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { text-align:left; padding:7px 4px; border-bottom:1px solid var(--line); font-size:14px; }
+  th { color:var(--mut); font-weight:500; }
+  td.n, th.n { text-align:right; white-space:nowrap; }
+  @media (max-width:600px) { .hide-sm { display:none; } header h1 { font-size:14px; } }
+  button, select, input { font:inherit; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  button.pri { background:var(--acc); color:#fff; border-color:var(--acc); }
+  button.ok { background:var(--ok); color:#fff; border-color:var(--ok); }
+  button.no { background:var(--bad); color:#fff; border-color:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .sev-critical { color:var(--bad); font-weight:600; } .sev-warning { color:var(--warn); } .sev-info { color:var(--mut); }
+  .mut { color:var(--mut); }
+  .login { max-width:360px; margin:12vh auto; }
+  .login input { width:100%; margin-bottom:10px; }
+  .tabs button.active { border-color:var(--acc); color:var(--acc); }
+  .hidden { display:none; }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<div id="login" class="login card hidden">
+  <h2>GLOBI POS · Hyrja e pronarit</h2>
+  <form id="loginForm">
+    <input id="email" type="email" placeholder="Email" autocomplete="username" required>
+    <input id="password" type="password" placeholder="Fjalëkalimi" autocomplete="current-password" required>
+    <input id="totp" inputmode="numeric" placeholder="Kodi 2FA (nëse është aktiv)" autocomplete="one-time-code">
+    <button class="pri" style="width:100%">Hyr</button>
+    <p id="loginErr" class="sev-critical"></p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <span id="live" class="dot" title="Lidhja live"></span>
+    <h1>GLOBI · Paneli i pronarit</h1>
+    <input id="day" type="date">
+    <button id="logout">Dil</button>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Të gjitha subjektet (raportohen veçmas)</h2>
+      <div class="scroll"><table id="consolidated"></table></div>
+    </div>
+    <div class="card" id="approvalsCard">
+      <h2>Miratime në pritje</h2>
+      <div id="approvals" class="mut">Asnjë</div>
+    </div>
+    <div class="row tabs" id="tabs" style="margin-bottom:12px"></div>
+    <div id="biz"></div>
+  </main>
+</div>
+
+<script>
+const API = '/api/v1';
+const S = { access: localStorage.getItem('g_access'), refresh: localStorage.getItem('g_refresh'), biz: null, ws: null, timer: null };
+const $ = (id) => document.getElementById(id);
+const L = (v) => Number(v || 0).toLocaleString('sq-AL', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' L';
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const today = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Tirane' });
+
+async function api(path, opts = {}, retry = true) {
+  const res = await fetch(API + path, { ...opts, headers: { 'content-type': 'application/json', ...(S.access ? { authorization: 'Bearer ' + S.access } : {}) } });
+  if (res.status === 401 && retry && S.refresh) { if (await refresh()) return api(path, opts, false); }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(body.message || res.statusText), { body, status: res.status });
+  return body;
+}
+async function refresh() {
+  try {
+    const r = await fetch(API + '/auth/refresh', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: S.refresh }) });
+    if (!r.ok) throw 0;
+    save(await r.json()); return true;
+  } catch { logout(); return false; }
+}
+function save(t) { S.access = t.accessToken; S.refresh = t.refreshToken; localStorage.setItem('g_access', S.access); localStorage.setItem('g_refresh', S.refresh); }
+function logout() { localStorage.removeItem('g_access'); localStorage.removeItem('g_refresh'); S.access = S.refresh = null; S.ws?.close(); show(false); }
+function show(app) { $('app').classList.toggle('hidden', !app); $('login').classList.toggle('hidden', app); }
+
+$('loginForm').onsubmit = async (e) => {
+  e.preventDefault(); $('loginErr').textContent = '';
+  try {
+    const r = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: $('email').value, password: $('password').value, totp: $('totp').value || undefined }) }, false);
+    save(r); start();
+  } catch (err) { $('loginErr').textContent = err.message; }
+};
+$('logout').onclick = async () => { try { await api('/auth/logout', { method: 'POST', body: JSON.stringify({ refreshToken: S.refresh }) }); } catch {} logout(); };
+$('day').onchange = () => loadAll();
+
+async function loadConsolidated() {
+  const c = await api('/dashboard/consolidated?day=' + $('day').value);
+  $('consolidated').innerHTML = '<tr><th>Subjekti</th><th class="hide-sm">NIPT</th><th class="n">Xhiro</th><th class="n">Paguar</th><th class="n">Hapur</th><th class="n">Anuluar</th><th class="n">Në turn</th><th class="n">Alarme</th></tr>' +
+    c.businesses.map((b) => `<tr><td>${esc(b.name)}</td><td class="mut hide-sm">${esc(b.nipt)}</td><td class="n">${L(b.turnover)}</td><td class="n">${b.paid_orders}</td><td class="n">${b.open_orders}</td><td class="n">${b.cancelled_orders}</td><td class="n">${b.staff_on_shift}</td><td class="n ${b.open_alerts ? 'sev-warning' : ''}">${b.open_alerts}</td></tr>`).join('');
+  if (!S.biz && c.businesses[0]) S.biz = c.businesses[0].id;
+  $('tabs').innerHTML = c.businesses.map((b) => `<button data-id="${b.id}" class="${b.id === S.biz ? 'active' : ''}">${esc(b.name)}</button>`).join('');
+  $('tabs').querySelectorAll('button').forEach((b) => b.onclick = () => { S.biz = b.dataset.id; loadAll(); });
+}
+
+async function loadApprovals() {
+  const r = await api('/approvals');
+  if (!r.approvals.length) { $('approvals').innerHTML = '<span class="mut">Asnjë</span>'; return; }
+  const kinds = { cancel_paid_order: 'Anulim porosie të paguar', discount: 'Zbritje mbi pragun' };
+  $('approvals').innerHTML = r.approvals.map((a) => `
+    <div class="row" style="border-bottom:1px solid var(--line);padding:8px 0">
+      <div style="flex:1;min-width:200px"><b>${esc(kinds[a.kind] || a.kind)}</b> · ${esc(a.business_name)}<br>
+        <span class="mut">${esc(a.requested_by_name)} · #${esc(a.payload.orderNumber ?? '')} ${a.payload.total ? L(a.payload.total) : ''} ${a.payload.amount ? 'zbritje ' + L(a.payload.amount) : ''} ${a.payload.reason ? '· ' + esc(a.payload.reason) : ''}</span></div>
+      <button class="ok" data-a="${a.id}" data-d="approve">Mirato</button>
+      <button class="no" data-a="${a.id}" data-d="reject">Refuzo</button>
+    </div>`).join('');
+  $('approvals').querySelectorAll('button').forEach((b) => b.onclick = async () => {
+    const totp = prompt('Kodi 2FA nga aplikacioni authenticator:');
+    if (!totp) return;
+    try { await api(`/approvals/${b.dataset.a}/decide`, { method: 'POST', body: JSON.stringify({ decision: b.dataset.d, totp }) }); loadAll(); }
+    catch (e) { alert(e.message); }
+  });
+}
+
+async function loadBusiness() {
+  if (!S.biz) return;
+  const d = await api(`/dashboard/business/${S.biz}?day=${$('day').value}`);
+  const s = d.sales;
+  const kpi = (l, v, cls = '') => `<div class="kpi"><div class="v ${cls}">${v}</div><div class="l">${l}</div></div>`;
+  const drawer = d.openShifts.reduce((t, x) => t + Number(x.cash_in_drawer), 0);
+  $('biz').innerHTML = `
+    <div class="card grid">
+      ${kpi('Xhiro e ditës', L(s.turnover))}
+      ${kpi('Porosi të paguara', s.paid_orders)}
+      ${kpi('Porosi të hapura', `${s.open_orders} · ${L(s.open_value)}`)}
+      ${kpi('Anulime', s.cancelled_orders, s.cancelled_orders ? 'sev-warning' : '')}
+      ${kpi('Gjendja e arkave', L(drawer))}
+      ${kpi('Shpenzime', L(d.expenses.total))}
+      ${kpi('Fitimi i përllogaritur', L(d.estimatedProfit), Number(d.estimatedProfit) < 0 ? 'sev-critical' : '')}
+      ${kpi('TVSH', L(s.vat))}
+    </div>
+    <div class="card"><h2>Alarme</h2>${d.alerts.length ? '<table>' + d.alerts.map((a) => `<tr><td class="sev-${a.severity}">${esc(a.message)}</td><td class="mut n">${new Date(a.created_at).toLocaleTimeString('sq-AL', { hour: '2-digit', minute: '2-digit' })}</td><td class="n"><button data-ack="${a.id}">OK</button></td></tr>`).join('') + '</table>' : '<span class="mut">Asnjë</span>'}</div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px">
+      <div class="card"><h2>Shitjet sipas punonjësve</h2><table><tr><th>Punonjësi</th><th class="n">Porosi</th><th class="n">Totali</th></tr>${d.salesByEmployee.map((e) => `<tr><td>${esc(e.full_name)}</td><td class="n">${e.orders}</td><td class="n">${L(e.total)}</td></tr>`).join('')}</table></div>
+      <div class="card"><h2>Punonjësit në turn</h2><table><tr><th>Punonjësi</th><th>Që prej</th><th class="n">Në arkë</th></tr>${d.openShifts.map((x) => `<tr><td>${esc(x.full_name)}</td><td>${new Date(x.opened_at).toLocaleTimeString('sq-AL', { hour: '2-digit', minute: '2-digit' })}</td><td class="n">${L(x.cash_in_drawer)}</td></tr>`).join('')}</table></div>
+      <div class="card"><h2>Pagesat sipas mënyrës</h2><table>${d.paymentsByMethod.map((p) => `<tr><td>${esc({ cash: 'Cash', card: 'Kartë', bank: 'Bankë', driver_cash: 'Te shoferët' }[p.method] || p.method)}</td><td class="n">${L(p.total)}</td></tr>`).join('')}</table></div>
+      <div class="card"><h2>Shoferët</h2><table><tr><th>Shoferi</th><th class="n">Arkëtuar</th><th class="n">Dorëzuar</th><th class="n">Pa dorëzuar</th></tr>${d.drivers.map((x) => `<tr><td>${esc(x.full_name)}</td><td class="n">${L(x.collected)}</td><td class="n">${L(x.settled)}</td><td class="n ${Number(x.outstanding) > 0 ? 'sev-warning' : ''}">${L(x.outstanding)}</td></tr>`).join('')}</table></div>
+      <div class="card"><h2>Delivery</h2><table><tr><th>#</th><th>Klienti</th><th>Statusi</th><th class="n">Totali</th></tr>${d.deliveries.map((o) => `<tr><td>${o.order_number}</td><td>${esc(o.customer_name)}</td><td>${esc(o.delivery_status)}</td><td class="n">${L(o.total)}</td></tr>`).join('')}</table></div>
+      <div class="card"><h2>Inventar nën minimum</h2>${d.lowStock.length ? '<table>' + d.lowStock.map((x) => `<tr><td>${esc(x.name)}</td><td class="n sev-warning">${Number(x.qty)}</td><td class="n mut">min ${Number(x.min_qty)}</td></tr>`).join('') + '</table>' : '<span class="mut">Në rregull</span>'}</div>
+      <div class="card"><h2>Porositë e hapura</h2><table>${d.openOrders.map((o) => `<tr><td>#${o.order_number}</td><td>${esc(o.table_label || o.type)}</td><td class="n">${L(o.total)}</td></tr>`).join('')}</table></div>
+    </div>`;
+  $('biz').querySelectorAll('[data-ack]').forEach((b) => b.onclick = async () => { await api(`/alerts/${b.dataset.ack}/ack`, { method: 'POST', body: '{}' }); loadAll(); });
+}
+
+function loadAll() {
+  clearTimeout(S.timer);
+  S.timer = setTimeout(() => Promise.all([loadConsolidated().then(loadBusiness), loadApprovals()]).catch((e) => console.error(e)), 150);
+}
+
+function connect() {
+  if (!S.access) return;
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${API}/ws?token=${encodeURIComponent(S.access)}`);
+  S.ws = ws;
+  ws.onopen = () => $('live').classList.add('on');
+  ws.onmessage = (m) => { const e = JSON.parse(m.data); if (e.type !== 'hello' && e.type !== 'pong') loadAll(); };
+  ws.onclose = async (e) => {
+    $('live').classList.remove('on');
+    if (!S.access) return;
+    if (e.code === 4401) await refresh();
+    setTimeout(connect, 3000);
+  };
+}
+
+function start() { show(true); $('day').value ||= today(); loadAll(); connect(); setInterval(loadAll, 60000); }
+if (S.access) start(); else show(false);
+</script>
+</body>
+</html>

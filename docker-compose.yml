@@ -1,0 +1,153 @@
+# GLOBI POS — prodhim. Shih docs/INSTALIMI.md.
+# Vetëm Nginx ekspozohet në internet (80/443). PostgreSQL, Redis dhe API janë në rrjetin e brendshëm.
+name: globi
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: globi
+      POSTGRES_USER: globi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?vendos POSTGRES_PASSWORD në .env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U globi -d globi"]
+      interval: 10s
+      retries: 5
+    networks: [internal]
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    environment: { REDIS_PASSWORD: "${REDIS_PASSWORD:?vendos REDIS_PASSWORD}" }
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep PONG"]
+      interval: 10s
+    networks: [internal]
+    logging: *logging
+
+  api:
+    build: ./apps/api
+    image: ${API_IMAGE:-globi/api:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://globi:${POSTGRES_PASSWORD}@postgres:5432/globi
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:?vendos JWT_SECRET (min 32 karaktere)}
+      CORS_ORIGINS: https://${DOMAIN}
+      TRUST_PROXY: "172.16.0.0/12"
+      FISCAL_MODE: ${FISCAL_MODE:-mock}
+      LOG_LEVEL: info
+    stop_grace_period: 30s
+    networks: [internal]
+    logging: *logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ["80:80", "443:443"]
+    environment: { DOMAIN: "${DOMAIN:?vendos DOMAIN, p.sh. pos.globi.al}" }
+    volumes:
+      - ./infra/nginx/templates:/etc/nginx/templates:ro
+      - ./apps/owner-web:/usr/share/nginx/owner:ro
+      - certbot-www:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt:ro
+    networks: [internal]
+    logging: *logging
+
+  certbot:
+    image: certbot/certbot:v3.1.0
+    restart: unless-stopped
+    volumes:
+      - certbot-www:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+    # Provon rinovimin çdo 12 orë; Let's Encrypt rinovon kur certifikatës i mbeten < 30 ditë.
+    entrypoint: ["/bin/sh", "/renew.sh"]
+    configs: [{ source: certbot_renew, target: /renew.sh }]
+    logging: *logging
+
+  backup:
+    build: ./infra/backup
+    restart: unless-stopped
+    depends_on: [postgres]
+    environment:
+      PGHOST: postgres
+      PGUSER: globi
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: globi
+      BACKUP_CRON: ${BACKUP_CRON:-15 3 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BACKUP_ENCRYPTION_PASSPHRASE: ${BACKUP_ENCRYPTION_PASSPHRASE:?vendos BACKUP_ENCRYPTION_PASSPHRASE}
+      # Ruajtja jashtë serverit: çdo object storage S3-compatible (Hetzner, Backblaze B2, AWS S3, Wasabi...)
+      S3_ENDPOINT: ${S3_ENDPOINT:?vendos S3_ENDPOINT}
+      S3_BUCKET: ${S3_BUCKET:?vendos S3_BUCKET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?vendos S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?vendos S3_SECRET_KEY}
+      S3_REGION: ${S3_REGION:-auto}
+      HEALTHCHECK_URL: ${BACKUP_HEALTHCHECK_URL:-}
+    volumes: [backups:/backups]
+    networks: [internal]
+    logging: *logging
+
+  # ===== Monitorimi (opsional): docker compose --profile monitoring up -d =====
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: [monitoring]
+    restart: unless-stopped
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    networks: [internal]
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    profiles: [monitoring]
+    restart: unless-stopped
+    pid: host
+    volumes: ["/:/host:ro,rslave"]
+    command: ["--path.rootfs=/host"]
+    networks: [internal]
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: [monitoring]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-ndrysho}
+      GF_SERVER_ROOT_URL: https://${DOMAIN}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    volumes: [grafanadata:/var/lib/grafana]
+    networks: [internal]
+
+configs:
+  certbot_renew:
+    content: |
+      trap exit TERM
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --quiet
+        sleep 12h
+      done
+
+networks:
+  internal: {}
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  backups: {}
+  certbot-www: {}
+  letsencrypt: {}
+  promdata: {}
+  grafanadata: {}
